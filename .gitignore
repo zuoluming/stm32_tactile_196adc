@@ -1,0 +1,22 @@
+# Keil build output
+/MDK-ARM/tactile_196channel/
+/MDK-ARM/*.log
+/MDK-ARM/*.lst
+/MDK-ARM/*.uvguix.*
+/MDK-ARM/*.uvoptx
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.map
+*.lnp
+*.dep
+*.build_log.htm
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
