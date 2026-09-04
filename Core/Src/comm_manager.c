@@ -9,11 +9,24 @@
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
 extern PCD_HandleTypeDef hpcd_USB_FS;
+
+#define USB_TX_QUEUE_DEPTH 4U
+
+typedef struct
+{
+  uint16_t length;
+  uint8_t data[COMM_MAX_MESSAGE_SIZE];
+} UsbTxQueueEntry;
+
+static UsbTxQueueEntry usb_tx_queue[USB_TX_QUEUE_DEPTH];
+static uint8_t usb_tx_head;
+static uint8_t usb_tx_tail;
+static uint8_t usb_tx_count;
+static uint8_t usb_tx_active;
 #else
 #include "can.h"
-#endif
-
 static uint8_t tx_buffer[COMM_MAX_MESSAGE_SIZE];
+#endif
 
 #if COMMUNICATION_MODE == COMM_MODE_CAN
 #define CAN_FRAGMENT_DATA_SIZE 6U
@@ -58,6 +71,10 @@ static Comm_StatusTypeDef CAN_CommInit(void)
 Comm_StatusTypeDef Comm_Init(void)
 {
 #if COMMUNICATION_MODE == COMM_MODE_USB
+  usb_tx_head = 0U;
+  usb_tx_tail = 0U;
+  usb_tx_count = 0U;
+  usb_tx_active = 0U;
   MX_USB_DEVICE_Init();
   return COMM_STATUS_OK;
 #else
@@ -74,29 +91,24 @@ Comm_StatusTypeDef Comm_Send(const uint8_t *data, uint16_t length)
   }
 
 #if COMMUNICATION_MODE == COMM_MODE_USB
-  USBD_CDC_HandleTypeDef *cdc;
-  uint8_t usb_status;
-
   if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
       (hUsbDeviceFS.pClassData == NULL))
   {
     return COMM_STATUS_BUSY;
   }
 
-  cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
-  if (cdc->TxState != 0U)
+  Comm_Process();
+  if (usb_tx_count >= USB_TX_QUEUE_DEPTH)
   {
     return COMM_STATUS_BUSY;
   }
 
-  memcpy(tx_buffer, data, length);
-  usb_status = CDC_Transmit_FS(tx_buffer, length);
-  if (usb_status == USBD_OK)
-  {
-    return COMM_STATUS_OK;
-  }
-
-  return (usb_status == USBD_BUSY) ? COMM_STATUS_BUSY : COMM_STATUS_ERROR;
+  usb_tx_queue[usb_tx_tail].length = length;
+  memcpy(usb_tx_queue[usb_tx_tail].data, data, length);
+  usb_tx_tail = (uint8_t)((usb_tx_tail + 1U) % USB_TX_QUEUE_DEPTH);
+  ++usb_tx_count;
+  Comm_Process();
+  return COMM_STATUS_OK;
 #else
   if (can_tx_active != 0U)
   {
@@ -115,7 +127,41 @@ Comm_StatusTypeDef Comm_Send(const uint8_t *data, uint16_t length)
 
 void Comm_Process(void)
 {
-#if COMMUNICATION_MODE == COMM_MODE_CAN
+#if COMMUNICATION_MODE == COMM_MODE_USB
+  USBD_CDC_HandleTypeDef *cdc;
+  uint8_t usb_status;
+
+  if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
+      (hUsbDeviceFS.pClassData == NULL))
+  {
+    return;
+  }
+
+  cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+  if (usb_tx_active != 0U)
+  {
+    if (cdc->TxState != 0U)
+    {
+      return;
+    }
+
+    usb_tx_head = (uint8_t)((usb_tx_head + 1U) % USB_TX_QUEUE_DEPTH);
+    --usb_tx_count;
+    usb_tx_active = 0U;
+  }
+
+  if ((usb_tx_count == 0U) || (cdc->TxState != 0U))
+  {
+    return;
+  }
+
+  usb_status = CDC_Transmit_FS(usb_tx_queue[usb_tx_head].data,
+                               usb_tx_queue[usb_tx_head].length);
+  if (usb_status == USBD_OK)
+  {
+    usb_tx_active = 1U;
+  }
+#else
   CAN_TxHeaderTypeDef header = {0};
   uint32_t mailbox;
   uint16_t remaining;
@@ -163,16 +209,13 @@ void Comm_Process(void)
 uint8_t Comm_IsBusy(void)
 {
 #if COMMUNICATION_MODE == COMM_MODE_USB
-  USBD_CDC_HandleTypeDef *cdc;
-
   if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
       (hUsbDeviceFS.pClassData == NULL))
   {
     return 1U;
   }
 
-  cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
-  return (cdc->TxState != 0U) ? 1U : 0U;
+  return (usb_tx_count >= USB_TX_QUEUE_DEPTH) ? 1U : 0U;
 #else
   return can_tx_active;
 #endif

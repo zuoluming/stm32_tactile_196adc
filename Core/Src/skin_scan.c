@@ -42,6 +42,7 @@ volatile uint8_t g_skin_baseline_ready;
 
 static volatile uint8_t adc_transfer_done;
 static volatile HAL_StatusTypeDef adc_transfer_status;
+static uint16_t adc_group_buffer[7];
 static uint8_t current_row;
 static uint32_t cycles_per_us;
 static uint8_t aggregate_count;
@@ -49,6 +50,10 @@ static uint32_t aggregate_sum[SKIN_ROWS][SKIN_COLS];
 static uint16_t aggregate_min[SKIN_ROWS][SKIN_COLS];
 static uint16_t aggregate_max[SKIN_ROWS][SKIN_COLS];
 static uint8_t aggregate_locked[SKIN_ROWS][SKIN_COLS];
+static uint16_t filter_history[SKIN_OVERSAMPLE_COUNT][SKIN_ROWS][SKIN_COLS];
+static uint8_t filter_write_index;
+static uint8_t filter_history_count;
+static uint8_t baseline_update_count;
 static int32_t baseline_q16[SKIN_ROWS][SKIN_COLS];
 static uint8_t press_count[SKIN_ROWS][SKIN_COLS];
 static uint8_t release_count[SKIN_ROWS][SKIN_COLS];
@@ -108,13 +113,14 @@ static void enable_row(uint8_t row)
 static HAL_StatusTypeDef sample_group(uint16_t *destination)
 {
   uint32_t start;
+  uint8_t index;
   HAL_StatusTypeDef conversion_status;
   HAL_StatusTypeDef status;
 
   adc_transfer_done = 0U;
   adc_transfer_status = HAL_BUSY;
 
-  status = HAL_ADC_Start_DMA(&hadc1, (uint32_t *)destination, 7U);
+  status = HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_group_buffer, 7U);
   if (status != HAL_OK)
   {
     return status;
@@ -134,6 +140,15 @@ static HAL_StatusTypeDef sample_group(uint16_t *destination)
   if (HAL_ADC_Stop_DMA(&hadc1) != HAL_OK)
   {
     return HAL_ERROR;
+  }
+
+  if (conversion_status == HAL_OK)
+  {
+    /* ADC ranks are PA0..PA6; electrode columns are PA6..PA0. */
+    for (index = 0U; index < 7U; ++index)
+    {
+      destination[index] = adc_group_buffer[6U - index];
+    }
   }
 
   return conversion_status;
@@ -201,6 +216,52 @@ static void aggregate_add_frame(void)
     }
   }
   ++aggregate_count;
+}
+
+static void filter_add_frame(void)
+{
+  memcpy(filter_history[filter_write_index], g_skin_matrix,
+         sizeof(g_skin_matrix));
+  filter_write_index =
+      (uint8_t)((filter_write_index + 1U) % SKIN_OVERSAMPLE_COUNT);
+  if (filter_history_count < SKIN_OVERSAMPLE_COUNT)
+  {
+    ++filter_history_count;
+  }
+}
+
+static uint16_t filter_sample(uint8_t row, uint8_t col)
+{
+  uint8_t index;
+  uint16_t sample;
+  uint16_t minimum = 0xFFFFU;
+  uint16_t maximum = 0U;
+  uint32_t sum = 0U;
+
+  for (index = 0U; index < SKIN_OVERSAMPLE_COUNT; ++index)
+  {
+    sample = filter_history[index][row][col];
+    sum += sample;
+    if (sample < minimum)
+    {
+      minimum = sample;
+    }
+    if (sample > maximum)
+    {
+      maximum = sample;
+    }
+  }
+
+  sum -= minimum;
+  sum -= maximum;
+  return (uint16_t)((sum + ((SKIN_OVERSAMPLE_COUNT - 2U) / 2U)) /
+                    (SKIN_OVERSAMPLE_COUNT - 2U));
+}
+
+static void reset_baseline_update_window(void)
+{
+  memset(aggregate_locked, 0, sizeof(aggregate_locked));
+  baseline_update_count = 0U;
 }
 
 static void finish_initial_calibration(void)
@@ -318,11 +379,10 @@ static void build_output_frame(void)
   }
 }
 
-static void process_oversampled_frame(void)
+static void process_filtered_frame(uint8_t update_baseline)
 {
   uint8_t row;
   uint8_t col;
-  uint32_t trimmed_sum;
   uint16_t sample;
   uint16_t baseline;
   int32_t target_q16;
@@ -333,11 +393,7 @@ static void process_oversampled_frame(void)
   {
     for (col = 0U; col < SKIN_COLS; ++col)
     {
-      trimmed_sum = aggregate_sum[row][col] -
-                    aggregate_min[row][col] - aggregate_max[row][col];
-      sample = (uint16_t)((trimmed_sum +
-               ((SKIN_OVERSAMPLE_COUNT - 2U) / 2U)) /
-               (SKIN_OVERSAMPLE_COUNT - 2U));
+      sample = filter_sample(row, col);
       baseline = baseline_value(row, col);
 
       if (g_skin_pressed[row][col] != 0U)
@@ -349,7 +405,8 @@ static void process_oversampled_frame(void)
         g_skin_pressure[row][col] = 0U;
       }
 
-      if ((aggregate_locked[row][col] == 0U) &&
+      if ((update_baseline != 0U) &&
+          (aggregate_locked[row][col] == 0U) &&
           (absolute_difference(sample, baseline) <
            SKIN_PRESS_ON_THRESHOLD))
       {
@@ -369,7 +426,11 @@ static void process_oversampled_frame(void)
   {
     ++g_skin_dropped_frames;
   }
-  aggregate_reset();
+
+  if (update_baseline != 0U)
+  {
+    reset_baseline_update_window();
+  }
 }
 
 static void process_complete_raw_frame(void)
@@ -386,10 +447,16 @@ static void process_complete_raw_frame(void)
   }
 
   update_press_state();
-  aggregate_add_frame();
-  if (aggregate_count >= SKIN_OVERSAMPLE_COUNT)
+  filter_add_frame();
+  if (baseline_update_count < SKIN_OVERSAMPLE_COUNT)
   {
-    process_oversampled_frame();
+    ++baseline_update_count;
+  }
+
+  if (filter_history_count >= SKIN_OVERSAMPLE_COUNT)
+  {
+    process_filtered_frame(
+        (baseline_update_count >= SKIN_OVERSAMPLE_COUNT) ? 1U : 0U);
   }
 }
 
@@ -408,9 +475,13 @@ HAL_StatusTypeDef SkinScan_Init(void)
   memset(g_skin_baseline, 0, sizeof(g_skin_baseline));
   memset(g_skin_pressure, 0, sizeof(g_skin_pressure));
   memset(g_skin_pressed, 0, sizeof(g_skin_pressed));
+  memset(filter_history, 0, sizeof(filter_history));
   memset(baseline_q16, 0, sizeof(baseline_q16));
   memset(press_count, 0, sizeof(press_count));
   memset(release_count, 0, sizeof(release_count));
+  filter_write_index = 0U;
+  filter_history_count = 0U;
+  baseline_update_count = 0U;
   aggregate_reset();
 
   cycles_per_us = SystemCoreClock / 1000000U;
